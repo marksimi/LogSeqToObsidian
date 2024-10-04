@@ -4,6 +4,8 @@ import os
 import re
 import shutil
 import typing
+import requests
+from urllib.parse import urlparse, unquote
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(message)s")
 
@@ -50,6 +52,11 @@ parser.add_argument(
     default=False,
     action="store_true",
     help="Convert #[[long tags]] to [[long tags]]",
+)
+parser.add_argument(
+    "--verbose",
+    action="store_true",
+    help="Enable verbose output with detailed debug information",
 )
 
 # Global state isn't always bad mmkay
@@ -221,38 +228,47 @@ def update_assets(line: str, old_path: str, new_path: str):
         out = []
         name = match[1]
         old_relpath = match[2]
-        if old_relpath[:8] == "file:///":
+        print(f"Old note path: {old_path}")
+        print(f"Debug: old_relpath before processing: {old_relpath}")
+
+        if old_relpath.startswith("file:///"):
             old_relpath = old_relpath[7:]
-
+        
         old_relpath = old_relpath.replace("%20", " ")
+        print(f"Debug: old_relpath after processing: {old_relpath}")
 
-        old_asset_path = os.path.normpath(
-            os.path.join(os.path.dirname(old_path), old_relpath)
-        )
-        new_asset_path = os.path.join(
-            os.path.dirname(new_path), "attachments", os.path.basename(old_asset_path)
-        )
-        new_asset_dir = os.path.dirname(new_asset_path)
-        os.makedirs(new_asset_dir, exist_ok=True)
-        print("Old note path: " + old_path)
-        print("Old asset path: " + old_asset_path)
-        print("New asset path: " + new_asset_path)
-        try:
-            shutil.copyfile(old_asset_path, new_asset_path)
-            new_relpath = os.path.relpath(new_asset_path, os.path.dirname(new_path))
-        except FileNotFoundError:
-            print(
-                "Warning: copying the asset from "
-                + old_asset_path
-                + " to "
-                + new_asset_path
-                + " failed, skipping it"
+        if is_web_link(old_relpath):
+            print(f"Debug: Detected web link: {old_relpath}")
+            new_asset_dir = os.path.join(os.path.dirname(new_path), "attachments")
+            os.makedirs(new_asset_dir, exist_ok=True)
+            filename = download_image(old_relpath, new_asset_dir)
+            if filename:
+                print(f"Debug: Successfully downloaded image: {filename}")
+                new_asset_path = os.path.join(new_asset_dir, filename)
+                new_relpath = os.path.relpath(new_asset_path, os.path.dirname(new_path))
+            else:
+                print(f"Debug: Failed to download image, using original URL: {old_relpath}")
+                new_relpath = old_relpath
+        else:
+            old_asset_path = os.path.normpath(
+                os.path.join(os.path.dirname(old_path), old_relpath)
             )
-            new_relpath = old_relpath
-            # import ipdb; ipdb.set_trace()
+            print(f"Debug: Constructed old_asset_path: {old_asset_path}")
+            new_asset_dir = os.path.join(os.path.dirname(new_path), "attachments")
+            os.makedirs(new_asset_dir, exist_ok=True)
+            new_asset_path = os.path.join(new_asset_dir, os.path.basename(old_asset_path))
+            print(f"Debug: Attempting to copy from {old_asset_path} to {new_asset_path}")
+            try:
+                shutil.copyfile(old_asset_path, new_asset_path)
+                new_relpath = os.path.relpath(new_asset_path, os.path.dirname(new_path))
+                print(f"Debug: Successfully copied asset to {new_relpath}")
+            except Exception as e:
+                print(f"Debug: Error copying asset: {str(e)}")
+                print(f"Warning: copying the asset from {old_asset_path} to {new_asset_path} failed, skipping it")
+                new_relpath = old_relpath
 
-        if os.path.splitext(old_asset_path)[1].lower() in [".png", ".jpg", ".jpeg", ".gif"]:
-            out.append("!")
+        # Determine if the asset should be embedded (for images) or just linked
+        out.append("!" if os.path.splitext(old_relpath)[1].lower() in [".png", ".jpg", ".jpeg", ".gif"] else "")
         out.append("[" + name + "]")
         out.append("(" + new_relpath + ")")
 
@@ -262,6 +278,34 @@ def update_assets(line: str, old_path: str, new_path: str):
 
     return line
 
+def handle_web_asset(name: str, url: str, new_path: str) -> str:
+    """
+    Handles the processing of web-based assets (e.g., images from URLs).
+
+    This function attempts to download the asset from the given URL and update the link accordingly.
+
+    Args:
+        name (str): The display name of the asset in the markdown link.
+        url (str): The URL of the asset to be downloaded.
+        new_path (str): The new file path where the processed note will be saved.
+
+    Returns:
+        str: A markdown-formatted string with the updated asset link.
+              If download is successful, it points to the local copy.
+              If download fails, it retains the original URL.
+    """
+    print(f"Debug: Handling web asset: {url}")
+    new_asset_dir = os.path.join(os.path.dirname(new_path), "attachments")
+    os.makedirs(new_asset_dir, exist_ok=True)
+    
+    filename = download_image(url, new_asset_dir)
+    if filename:
+        print(f"Debug: Successfully downloaded image: {filename}")
+        new_relpath = os.path.join("attachments", filename)
+        return f"![{name}]({new_relpath})"
+    else:
+        print(f"Debug: Failed to download image, using original URL")
+        return f"![{name}]({url})"
 
 def update_image_dimensions(line: str) -> str:
     """Updates the dimensions of embedded images with custom height/width specified
@@ -282,6 +326,9 @@ def is_collapsed_line(line: str) -> bool:
     match = re.match(r"\s*collapsed:: true\s*", line)
     return match is not None
 
+def is_web_link(path: str) -> bool:
+    """Check if the path is a web link (URL)"""
+    return path.startswith(('http://', 'https://', 'ftp://'))
 
 def remove_block_links_embeds(line: str) -> str:
     """Returns the line stripped of any block links or embeddings"""
@@ -411,6 +458,28 @@ def unencode_filenames_for_links(old_str: str) -> str:
             new_str = new_str.replace(escape_str,replace_map[escape_str])
 
     return new_str
+
+def download_image(url: str, destination_folder: str) -> str:
+    """Download an image from a URL and save it to the specified destination folder"""
+    print(f"Debug: Attempting to download image from: {url}")
+    try:
+        response = requests.get(url, stream=True)
+        print(f"Debug: Response status code: {response.status_code}")
+        if response.status_code == 200: #successful request
+            filename = unquote(os.path.basename(urlparse(url).path))
+            filepath = os.path.join(destination_folder, filename)
+            with open(filepath, 'wb') as out_file:
+                shutil.copyfileobj(response.raw, out_file)
+            print(f"Debug: Successfully downloaded image: {filename}")
+            return filename
+    except Exception as e:
+        print(f"Debug: Error downloading image: {str(e)}")
+    return None
+
+def is_web_link(path: str) -> bool:
+    """Check if the path is a web link (URL)"""
+    parsed_url = urlparse(path)
+    return bool(parsed_url.scheme and parsed_url.netloc)
 
 args = parser.parse_args()
 
